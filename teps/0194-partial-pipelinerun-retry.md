@@ -62,7 +62,7 @@ when a valid new run can be constructed.
 2. A Kubernetes-routed `/retry` subresource or aggregated API server
 3. Automatic retry (`auto-retry` annotations / policies)
 4. Cross-namespace retries
-5. Separate user-facing partial/full mode selection; all retry requests use the controller's adaptive strategy
+5. Automatic adaptive strategy selection without user input; users explicitly choose `--full` or `--partial`
 6. User-modified memoized results
 7. Full Tekton Chains integration (must not fake skipped-task success; Chains contract is v2)
 8. Recreating, copying, or re-cloning workspaces; transferring PVC ownership; blocking source cleanup
@@ -92,11 +92,10 @@ minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
 #### Functional Requirements
 
 **Retry strategy:**
-- A single retry request asks the controller to choose the most efficient valid strategy
-- Use partial retry when there is a non-empty non-final failed subgraph and all required results and workspace bindings are available and usable
-- Otherwise, use full retry if the source PipelineRun still provides enough information to construct a valid run
-- If neither strategy can be constructed, fail setup with an actionable condition
-- Persist the selected strategy and reason before scheduling any TaskRuns; never change from partial to full after TaskRuns have started
+- The user explicitly selects the strategy via `--full` (default) or `--partial` on the CLI, expressed as a `tekton.dev/retryStrategy: full|partial` annotation on the retry PipelineRun
+- **`--full` (default):** Controller always performs a full retry; re-executes all main DAG tasks subject to their `when` expressions. No historical results are required
+- **`--partial`:** Controller attempts partial retry. If partial is not possible (non-empty failed subgraph unavailable, required results unreadable, or required PVCs missing/unusable), setup fails with an actionable condition. There is no silent fallback to full retry when the user explicitly requested partial
+- Persist the requested and selected strategy before scheduling any TaskRuns; the strategy cannot change after TaskRuns have started
 
 **Failed subgraph:**
 - Include explicit failures and interrupted in-flight tasks
@@ -113,9 +112,10 @@ minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
 - Do not create synthetic/ghost TaskRuns with forged `Succeeded` conditions
 
 **Result re-injection:**
-- Prefer harvest from `PipelineRun.status.results[]` then live `TaskRun.status.results[]` **when the planner is allowed to read those objects**
+- Harvest order: (1) `source.status.results[]`, (2) source `TaskRun.status.results[]`, (3) `source.status.retriedTaskResults[]` (inherited memoized results from a prior partial retry, enabling chained retries where earlier TaskRuns may be gone)
+- `retriedTaskResults` is populated as the **union** of freshly harvested results and results inherited from `source.status.retriedTaskResults[]`; this carry-forward invariant ensures one-hop lookup is sufficient for arbitrarily deep retry chains
 - Persist accepted memoized results in **status** (not as the user-writable source of truth)
-- Partial retry requires all required results; if any are missing or unreadable, select full retry when possible
+- Partial retry requires all required results; if any are missing or unreadable, setup fails with an actionable condition for `--partial`
 - Respect the ~4KB result size limit; large payloads belong in artifacts/CAS, not result fields
 - - **Authz:** Harvest only what the controller is already allowed to read.
   Tekton Results is out of v1. If required results are missing/unreadable, full retry
@@ -205,8 +205,9 @@ metadata:
   annotations:
     tekton.dev/retryOf: build-42
     tekton.dev/retryOfUID: 6fc8e6e6-1cc3-4fa5-bb3e-7c1b2e0b637a
+    tekton.dev/retryStrategy: partial   # "full" (default) or "partial"; set by CLI flag --full/--partial
 spec:
-  params: []       # typically copied from the source
+  params: []       # must be identical to the source run for partial retry; any diff causes setup failure
   workspaces:
     - name: shared
       persistentVolumeClaim:
@@ -218,21 +219,21 @@ spec:
 2. **Controller-side setup before scheduling TaskRuns:**
    - Resolve source by name and verify UID
    - Snapshot `source.status.pipelineSpec` onto the retry (controller-owned)
-   - Compute the failed subgraph and assess required results and workspace bindings
-   - Select and persist `status.retryMetadata.strategy` (`partial` or `full`) and the reason
-   - For partial retry, harvest results into **status** memoization fields and validate the required user-owned PVCs
-   - For full retry, mark every DAG task for execution; no historical TaskRun results are required
+   - Read the requested strategy from `tekton.dev/retryStrategy` annotation (`full` if absent)
+   - For `partial`: compute the failed subgraph, verify required results and workspace bindings, verify effective params match the source; if any check fails, setup fails with an actionable condition (no fallback to full)
+   - For `full`: mark every DAG task for execution; no historical results or param matching required
+   - Persist `status.retryMetadata.strategy` and reason before creating any TaskRuns; strategy is immutable thereafter
+   - For partial retry, harvest results into **status** memoization fields (union of fresh harvest and `source.status.retriedTaskResults[]`) and validate required user-owned PVCs
    - Then create TaskRuns for the selected task set
 
 3. **Extending result resolution** so bypassed tasks resolve from memoized
    **status** (and live TaskRuns of this retry), never from forged child TaskRuns.
 
 4. **Thin clients:**
-   - `tkn pipelinerun retry <name>` creates the PipelineRun and watches the controller-selected strategy; there is no mode flag or interactive prompt
-   - Dashboard / Console expose one **Retry** action that creates the same object and links to it
-   - Best-effort local preview is optional; there is no authoritative `/retry?dryRun` API in v1
+   - `tkn pipelinerun retry <name>` defaults to `--full`; pass `--partial` to request partial retry (fail-closed if conditions are not met)
+   - Dashboard / Console replace the existing **Rerun** button with a single **Retry** action that includes a full/partial selector (dropdown or toggle, defaulting to full); after create, link to the new PipelineRun
 
-   **Current full Rerun baseline** (see architecture-analysis Part 5): today Dashboard **Rerun**, Console **Rerun** / **Start last run**, and `tkn pipeline start --last` / `--use-pipelinerun` (plus optional `tkn pipelinerun export`) all clone client-side with **no** Pipelines Rerun API and **no** `retryOf` lineage. There is no `tkn pipelinerun retry` yet. Adaptive Retry replaces or sits beside those paths; `--last` remains a non-adaptive full clone unless later wired as force-full.
+   **Current full Rerun baseline** (see architecture-analysis Part 5): today Dashboard **Rerun**, Console **Rerun** / **Start last run**, and `tkn pipeline start --last` / `--use-pipelinerun` (plus optional `tkn pipelinerun export`) all clone client-side with **no** Pipelines Rerun API and **no** `retryOf` lineage. There is no `tkn pipelinerun retry` yet. The new Retry action **replaces** the existing Rerun button in Dashboard and Console; `tkn pipeline start --last` remains available in the CLI for scripts that do not need lineage but has no UI equivalent.
 
 ### Notes and Caveats
 
@@ -342,6 +343,7 @@ controller's existing authorization is used:
 | --- | --- | --- |
 | Source `PipelineRun.status.results[]` | Anyone who can `get` that PR | Often yes, if the controller already reconciles that namespace |
 | Source `TaskRun.status.results[]` | `get`/`list` TaskRuns in that namespace | **Not guaranteed** (namespace-scoped installs, extra RBAC, objects already GC’d) |
+| Source `PipelineRun.status.retriedTaskResults[]` | Anyone who can `get` that PR | Yes — controller-owned status, same authorization as reading the source PR; enables chained retries where earlier TaskRuns are gone |
 | Tekton Results records | Results API authz (often per-tenant / user) | **Not a v1 store.** V2 access is caller-authorized; the Pipelines controller SA is not assumed to query all namespaces’ stored runs. |
 | Artifacts / CAS | Store-specific credentials | Same: do not assume cluster-wide controller access |
 
@@ -365,14 +367,18 @@ into **status** memoization (e.g. `status.retriedTaskResults`).
 **Harvest order (during setup):**
 1. **Bubbled results** from `source.status.results[]` (preferred)
 2. Source `TaskRun.status.results[]` (if available and readable)
+3. `source.status.retriedTaskResults[]` — inherited memoized results from a prior partial retry (enables chained retries; earlier TaskRuns may be gone)
+
+**Carry-forward invariant:** `retriedTaskResults` on each retry is populated as the **union** of freshly harvested results and results inherited from `source.status.retriedTaskResults[]`. This ensures one-hop lookup is sufficient for arbitrarily deep retry chains: `retryOf` always points to the immediate parent, and that parent's `retriedTaskResults` already contains the complete set needed by its preserved tasks.
 
 **Resolution order (during execution of `ResolveResultRef()`):**
 1. Live TaskRuns of **this** retry
 2. Memoized retry status for bypassed tasks
 
 If the controller **cannot** read required objects, it must not silently skip
-memoization or trust client-provided values. It selects full retry when
-possible; otherwise setup fails. A later v2 contract may allow a
+memoization or trust client-provided values. For `--partial` requests this is
+a hard failure (fail closed); there is no silent fallback to full retry when
+the user explicitly requested partial. A later v2 contract may allow a
 caller-authorized service to attach a verified snapshot with enough provenance
 for the controller to accept the values without forging TaskRun conditions.
 
@@ -475,16 +481,18 @@ The design should work with different storage backends; OCI is one possible opti
 
 ### API Design
 
-**Lineage (client-set, immutable after create):**
+**Lineage and strategy request (client-set, immutable after create):**
 
 ```yaml
 metadata:
   annotations:
     tekton.dev/retryOf: build-42
     tekton.dev/retryOfUID: 6fc8e6e6-1cc3-4fa5-bb3e-7c1b2e0b637a
+    tekton.dev/retryStrategy: partial   # "full" (default if absent) or "partial"
 ```
 
 `retryOf` is the **immediate parent name**; `retryOfUID` is that object's UID.
+`tekton.dev/retryStrategy` is set by the CLI (`--full`/`--partial`) and is immutable after create.
 `tekton.dev/retryAttempt` is **controller-derived**, not a client-chosen
 arbitrary number.
 
@@ -529,19 +537,21 @@ must also be ready. The strategy cannot change after TaskRuns are scheduled.
 *Validating webhook rules:*
 - Source UID matches `retryOfUID`
 - Same namespace for retry, source, and PVCs
-- Lineage annotations immutable (enforced by admission webhook)
+- Lineage annotations (`retryOf`, `retryOfUID`, `retryStrategy`) immutable after create (enforced by admission webhook)
 - `spec.pipelineSpec` immutable after creation (enforced by admission webhook)
 - No cross-namespace PVC references
+- `tekton.dev/retryStrategy` must be `full` or `partial` if set; defaults to `full` when absent
 
 *Runtime SAR checks (during reconciliation):*
 - Controller can `get` source PipelineRun
 - Controller can `get` source TaskRuns (if needed for harvest)
 - Caller could `get` source and `create` retry (verified at creation time)
+- For `--partial`: effective params on retry must match effective params of source (resolved against `source.status.pipelineSpec` defaults); mismatch causes setup failure with `strategyReason: parameter-mismatch`
 
 *General:*
 - Clients cannot write controller-owned retry status or memoized results
 - Controller-owned status only
-- Unreadable historical results make partial retry unavailable and select full retry when possible
+- For `--partial`: unreadable required results cause setup failure (fail closed); there is no silent fallback to full retry
 - Never accepted from an unsigned client payload
 
 **RBAC (illustrative):**
@@ -563,12 +573,8 @@ except optional result bubbling and durable PVCs if workspace reuse is required.
 re-executes the full DAG with no controller strategy or lineage
 (architecture-analysis Part 5).
 
-**With:** `tkn pipelinerun retry <name>` (create + watch with `retryOf`). The
-controller selects partial retry when possible and full retry otherwise.
-Dashboard and OpenShift Console expose one **Retry** action that creates the
-same request; automation uses the same API without an interactive prompt or
-strategy flag. Existing `--last` / UI Rerun can remain as a non-adaptive escape
-hatch until clients migrate.
+**With:** `tkn pipelinerun retry <name>` (default `--full`) or `tkn pipelinerun retry <name> --partial` for explicit partial reuse. The controller executes the requested strategy; `--partial` is fail-closed if conditions are not met.
+Dashboard and OpenShift Console **replace** the existing Rerun button with a single **Retry** action that includes a full/partial selector, defaulting to full. The `tkn pipeline start --last` path remains in the CLI only, for scripts that do not need lineage.
 
 Minimal v1 surface: annotations + status plan/results + reconciler setup path.
 No aggregated API, no new CRD required for v1.
@@ -586,21 +592,19 @@ subresource like `/status` or `/scale`.
 
 ### User Experience
 
-One Retry action on a terminal unsuccessful PipelineRun. The controller selects `partial` when it can plan a failed subgraph and access required results/workspaces; 
-otherwise `full` when a valid new run is still possible. No task picker, strategy flag, or confirmation dialog.
+One Retry action on a terminal unsuccessful PipelineRun. The user explicitly selects the strategy: `--full` (default) for a clean full re-run, or `--partial` to reuse eligible preserved results. With `--partial`, if the controller cannot plan a valid partial retry (missing results, param mismatch, unusable PVC), setup fails with an actionable error — there is no silent fallback to full retry.
 
-Clients create the retry PipelineRun with lineage, source params, and any same-namespace user-owned PVC binding. Status reports `strategy` / `strategyReason`, preserved vs rerun tasks, and setup errors (including RWO wait/deadline).
-Docs warn that full fallback may redo successful work and that PVC reuse is as-is, not a snapshot.
+Clients create the retry PipelineRun with lineage, source params, the `tekton.dev/retryStrategy` annotation, and any same-namespace user-owned PVC binding. Status reports `strategy` / `strategyReason`, preserved vs rerun tasks, and setup errors (including RWO wait/deadline).
+Docs warn that PVC reuse is as-is (not a snapshot), that `--partial` requires identical params to the source, and that non-idempotent tasks may have side effects on re-run.
 
 **How users understand retry strategy:**
 - Status shows `strategy: partial` or `strategy: full` + `strategyReason`
-- Example reasons: `required-data-available`, `missing-results`, `rwo-busy-deadline`, `workspace-unavailable`
+- Example reasons: `required-data-available`, `missing-results`, `parameter-mismatch`, `rwo-busy-deadline`, `workspace-unavailable`
 - Users can inspect `status.preservedTasks` and `status.rerunTasks` to understand what was reused
 
-**Dashboard / OpenShift Console:** One Retry on PipelineRun details and list (create permission / read-only rules as today). Replaces or consolidates full Rerun; 
-keep Edit and run / Pipeline Start separate. After create, link to the new PipelineRun.
+**Dashboard / OpenShift Console:** Replace the existing **Rerun** button with a single **Retry** action on terminal unsuccessful PipelineRuns. The action includes a full/partial selector (dropdown or toggle) defaulting to **full**. Selecting **partial** and clicking Retry creates a PipelineRun with `retryOf` lineage and `tekton.dev/retryStrategy: partial`; the UI surfaces the setup failure if partial conditions are not met. After create, link to the new PipelineRun.
 
-**CLI:** `tkn pipelinerun retry <name>` creates with `retryOf` / `retryOfUID`, watches, and prints the selected strategy. Keep `tkn pipeline start --last / --use-pipelinerun` as a non-adaptive full clone for existing scripts.
+**CLI:** `tkn pipelinerun retry <name>` defaults to `--full`. Use `--partial` to request partial retry; the command fails if the controller cannot satisfy the partial request. `tkn pipeline start --last / --use-pipelinerun` remains available for scripts that do not need lineage — it has no `retryOf` annotation and is unaffected by this design.
 
 Preview: optional client best-effort; not a guaranteed server dry-run.
 
@@ -616,14 +620,16 @@ validated in tests; the architectural win is **one** planner.
 |------|------------|
 | Side effects | Warn; document idempotent tasks; no auto-retry |
 | Workspace consistency | Warn; opt-in PVC reuse makes no snapshot or reproducibility guarantee |
-| Partial-reuse data or PVC unavailable | Select full retry when a valid new run can be constructed; otherwise fail with an actionable condition |
+| Partial-reuse data or PVC unavailable | Fail closed with an actionable condition; no silent fallback to full when `--partial` was requested |
+| Parameter changes invalidate preserved results | `--partial` requires effective params to be identical to the source; any diff causes setup failure with `strategyReason: parameter-mismatch` |
 | RWO busy | Pending + requeue until deadline if the selected strategy uses the claim |
 | Tekton/PVC exclusivity | Prevent assignment when a visible Tekton run uses the claim; storage and other Pods are out of scope |
 | Source pruned quickly | Document v1 window; v2 Results/artifacts |
 | Result size | 4KB limit; artifacts for large data |
 | Chains false attestation | No forged TaskRun success |
 | `onError: continue` staleness | Documented v1 tradeoff |
-| Unauthorized historical results | Do not reuse them; select full retry when possible. V2 may enable partial retry through a verified, source- and plan-bound snapshot |
+| Unauthorized historical results | Do not reuse them; fail closed for `--partial`. V2 may enable partial retry through a verified, source- and plan-bound snapshot |
+| Chained retry after earlier TaskRuns are GC'd | Carry-forward invariant: each retry's `retriedTaskResults` is the union of fresh harvest and `source.status.retriedTaskResults[]`; one-hop lookup is always sufficient |
 
 ### Drawbacks
 
