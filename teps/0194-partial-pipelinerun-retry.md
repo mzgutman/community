@@ -114,6 +114,8 @@ minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
 **Result re-injection:**
 - Harvest order: (1) `source.status.results[]`, (2) source `TaskRun.status.results[]`, (3) `source.status.retriedTaskResults[]` (inherited memoized results from a prior partial retry, enabling chained retries where earlier TaskRuns may be gone)
 - `retriedTaskResults` is populated as the **union** of freshly harvested results and results inherited from `source.status.retriedTaskResults[]`; this carry-forward invariant ensures one-hop lookup is sufficient for arbitrarily deep retry chains
+- `retriedTaskResults[].results[]` uses `v1.ResultValue` (the same type as `TaskRun.Status.Results[].Value`), supporting `string`, `array`, and `object` result types
+- For bypassed **matrix tasks**, harvest step 2 finds all N source TaskRuns for the pipeline task, sorts them by TaskRun name for deterministic ordering, and aggregates each result name into a single `type: array` entry in `retriedTaskResults`; the array index order is fixed at harvest time and must match the source run's ordering
 - Persist accepted memoized results in **status** (not as the user-writable source of truth)
 - Partial retry requires all required results; if any are missing or unreadable, setup fails with an actionable condition for `--partial`
 - Respect the ~4KB result size limit; large payloads belong in artifacts/CAS, not result fields
@@ -297,6 +299,7 @@ The controller applies these rules to the source `PipelineRunFacts`:
 **Rule 5 - Matrix (initial release):** Any combination failed → re-run all combinations.
 - Rationale: Matrix expansion happens at task level; no partial-within-matrix in alpha/beta.
 - Future: a later release could support per-combination retry if needed.
+- **Bypassed matrix tasks:** If all combinations of a matrix task succeeded and it is preserved (not in the subgraph), the controller must still make its aggregated results available to any re-running downstream tasks that reference `$(tasks.X.results.Y[*])` or `$(tasks.X.results.Y[i])`. See the Result Re-injection section for the required harvest and state-machine handling.
 
 **Rule 6 - Finally:** Not in the partial subgraph; they run fresh on either retry strategy. If *only* finally failed, the partial subgraph is empty and the controller selects a full retry when possible.
 
@@ -375,11 +378,36 @@ into **status** memoization (e.g. `status.retriedTaskResults`).
 2. Source `TaskRun.status.results[]` (if available and readable)
 3. `source.status.retriedTaskResults[]` — inherited memoized results from a prior partial retry (enables chained retries; earlier TaskRuns may be gone)
 
+**Matrix task memoization (harvest step 2 extension):**
+For a bypassed matrix pipeline task (all combinations succeeded, task is in `preservedTasks`):
+- Find **all N source TaskRuns** for that pipeline task using the `tekton.dev/pipelineTask` label.
+- Sort them by TaskRun name (lexicographic ascending), matching the ordering produced by the existing `createResultsCacheMatrixedTaskRuns` function in the reconciler.
+- For each result name, aggregate the scalar string values from all N TaskRuns into a single ordered array.
+- Store as a `type: array` result entry in `retriedTaskResults` (using `v1.ResultValue{Type: ParamTypeArray, ArrayVal: [...]}`).
+
+The array index ordering is fixed at harvest time. Array index 0 in the memoized result must correspond to the same matrix combination as index 0 in the source run. This invariant is required for downstream tasks that reference individual indices such as `$(tasks.build-images.results.IMAGE_REF[0])`.
+
 **Carry-forward invariant:** `retriedTaskResults` on each retry is populated as the **union** of freshly harvested results and results inherited from `source.status.retriedTaskResults[]`. This ensures one-hop lookup is sufficient for arbitrarily deep retry chains: `retryOf` always points to the immediate parent, and that parent's `retriedTaskResults` already contains the complete set needed by its preserved tasks.
 
 **Resolution order (during execution of `ResolveResultRef()`):**
 1. Live TaskRuns of **this** retry
 2. Memoized retry status for bypassed tasks
+
+**`isBypassed()` predicate and state machine impact:**
+Tekton's existing result-resolution guards — in `convertToResultRefs`, `GetTaskRunsResults`, and related functions — gate on `isSuccessful() || isFailure()`. A bypassed task has no live child TaskRuns on the retry PipelineRun, so both predicates return false. Without additional handling, these guards produce an error ("task was not finished") even when the task's results are fully memoized in `retriedTaskResults`.
+
+The implementation must introduce an `isBypassed()` predicate on `ResolvedPipelineTask`, set to `true` for every task in `preservedTasks` during retry setup. Every guard that currently checks `isSuccessful() || isFailure()` in a result-resolution path must be extended to also pass when `isBypassed()` is true, resolving from memoized status instead of live TaskRun objects.
+
+For bypassed **matrix tasks** specifically, the controller must pre-populate `ResolvedPipelineTask.ResultsCache` from the aggregated array stored in `retriedTaskResults` before any TaskRun scheduling begins. The existing `findResultValuesForMatrix` → `ResultsCache` lookup then works correctly once the cache is seeded and the `isBypassed()` gate is respected.
+
+**Semantic change to `GetTaskRunsResults()`:** Once bypassed tasks satisfy the `isBypassed()` gate, `GetTaskRunsResults()` will include them alongside tasks with live TaskRuns. The callers of this function are:
+- `ApplyTaskResultsToPipelineResults` — pipeline-level result computation; correctly resolves pipeline results that reference bypassed tasks' memoized values.
+- `ApplyResultsToWorkspaceBindings` — workspace binding substitution; array results are already skipped (`case v1.ResultsTypeArray: continue`), so no side effect.
+- `PropagateResults` — implicit result propagation to downstream tasks; correctly propagates memoized array results.
+
+This behavior is correct and desired, but must be documented internally: entries in `GetTaskRunsResults()` for bypassed tasks are sourced from memoized status and have no backing live TaskRun object. Code that iterates this map must not unconditionally dereference a live TaskRun for every entry.
+
+`isBypassed()` is only ever set to `true` during retry setup for tasks in `preservedTasks`. Normal (non-retry) PipelineRuns never set this predicate, so existing behavior for all non-retry runs is unchanged.
 
 If the controller **cannot** read required objects, it must not silently skip
 memoization or trust client-provided values. For `--partial` requests this is
@@ -514,13 +542,24 @@ status:
     preservedTasks: ["clone", "build"]
     rerunTasks: ["test", "scan", "deploy"]
   retriedTaskResults:
-    - pipelineTaskName: clone
+    - pipelineTaskName: clone          # scalar string result
       results:
         - name: commit-sha
           value: "abc123def456"
+    - pipelineTaskName: build-images   # bypassed matrix task: aggregated array result
+      results:
+        - name: IMAGE_REF
+          type: array
+          value:
+            - "quay.io/org/img@sha256:aaa"   # index 0 — first combination by TaskRun name sort
+            - "quay.io/org/img@sha256:bbb"
+            - "quay.io/org/img@sha256:ccc"
+            - "quay.io/org/img@sha256:ddd"
 ```
 
 Field names are indicative; CRD types will be finalized in implementation.
+
+`retriedTaskResults[].results[]` uses `v1.ResultValue` (the same type as `TaskRun.Status.Results[].Value`), supporting `string`, `array`, and `object` result types. For a bypassed matrix task, the N scalar results produced by N TaskRun combinations are aggregated into a single `type: array` entry; the array index ordering matches the source run's TaskRun name sort order and is immutable after harvest.
 
 For `strategy: partial`, `preservedTasks` identifies tasks whose results are
 reused and `rerunTasks` identifies tasks selected for fresh execution. For
@@ -666,6 +705,7 @@ validated in tests; the architectural win is **one** planner.
 | `onError: continue` staleness | Documented initial-release tradeoff |
 | Unauthorized historical results | Do not reuse them; fail closed for `--partial`. Phase 2 may enable partial retry through a verified, source- and plan-bound snapshot |
 | Chained retry after earlier TaskRuns are GC'd | Carry-forward invariant: each retry's `retriedTaskResults` is the union of fresh harvest and `source.status.retriedTaskResults[]`; one-hop lookup is always sufficient |
+| Bypassed matrix task results unavailable to downstream re-running tasks | Harvest step 2 aggregates all N source TaskRuns for the matrix task into an ordered `type: array` entry in `retriedTaskResults`; `isBypassed()` predicate added to `ResolvedPipelineTask` and threaded through all `isSuccessful() \|\| isFailure()` guards in result-resolution paths; `ResultsCache` pre-populated from memoized array before TaskRun scheduling; `GetTaskRunsResults()` semantics updated to include bypassed-task entries (sourced from memoized status, not live TaskRuns); no effect on non-retry PipelineRuns |
 
 ### Drawbacks
 
