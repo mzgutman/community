@@ -56,7 +56,7 @@ when a valid new run can be constructed.
 
 ### Non-Goals
 
-**Out of scope for v1:**
+**Out of scope for initial release (alpha):**
 
 1. Recursive partial retry inside nested PipelineRuns (child PRs are atomic)
 2. A Kubernetes-routed `/retry` subresource or aggregated API server
@@ -152,7 +152,7 @@ minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
 
 **API shape:**
 - Retry is requested by creating a new PipelineRun with paired source references
-- No `/retry` HTTP API in v1
+- No `/retry` HTTP API in alpha or beta
 
 #### Non-Functional Requirements
 
@@ -189,7 +189,7 @@ Tekton are out of scope.
 
 **Backward compatibility:**
 - Normal PipelineRuns unchanged
-- Feature optional
+- Feature gated behind `enable-api-fields` flag, graduating alpha → beta → stable
 
 ## Proposal
 
@@ -558,6 +558,39 @@ must also be ready. The strategy cannot change after TaskRuns are scheduled.
 - **Caller:** `get` source PR, `create` PipelineRuns.
 - **Controller SA:** existing reconcile rights only (not cluster-wide Results).
 
+### CI Integration (e.g. Pipelines-as-Code)
+
+Integrations can identify a retry by inspecting the `tekton.dev/retryOf` and
+`tekton.dev/retryOfUID` annotations, which are client-set and immutable after
+creation.
+
+**Check / commit status behavior:**
+- Checks are scoped to **commits**, not PipelineRuns. A retry should be
+  associated with the original commit's check, not with any newer commit, even
+  if the PR has advanced since the original execution.
+- A new execution triggered by a new push should create a check for that new commit.
+- For a retry, the integration may either update the original commit's existing
+  check run or create a separate attempt entry on the same commit. Each is a
+  valid policy: updating gives a cleaner single-result view; a separate entry
+  preserves the full attempt history.
+
+**New commits since the original run:**
+- If the PR has advanced since the source run, the retry still refers to the
+  original commit. Whether to warn, block, or proceed is left to the integration.
+- Partial reuse of results from a different commit is semantically unsound;
+  integrations that detect this condition should surface it clearly.
+- Detecting a PR advance requires knowing which commit the source run tested.
+  If the TEP's provenance annotations record that commit SHA, integrations can
+  compare it against the PR's current HEAD; otherwise the integration must
+  obtain that information through its own means (e.g. the triggering event).
+
+**What the TEP provides to integrations:**
+- `tekton.dev/retryOf` / `tekton.dev/retryOfUID` — identify retry lineage
+- `status.retryMetadata.strategy` — `full` or `partial`
+- `status.retryMetadata.preservedTasks` / `rerunTasks` — which tasks ran fresh
+
+The exact check-status policy is integration-specific and out of scope for the initial release.
+
 ## Design Evaluation
 
 ### Reusability
@@ -581,7 +614,7 @@ No aggregated API, no new CRD required for v1.
 
 ### Flexibility
 
-No Results/Chains/artifact store is required for v1. V2 may use caller-authorized
+No Results/Chains/artifact store is required for alpha/beta. A later release may use caller-authorized
 Results and trusted artifacts/snapshots. Opinionated: server-side plan; matrix
 all-or-nothing; user-owned PVC only.
 
@@ -605,8 +638,6 @@ Docs warn that PVC reuse is as-is (not a snapshot), that `--partial` requires id
 **Dashboard / OpenShift Console:** Replace the existing **Rerun** button with a single **Retry** action on terminal unsuccessful PipelineRuns. The action includes a full/partial selector (dropdown or toggle) defaulting to **full**. Selecting **partial** and clicking Retry creates a PipelineRun with `retryOf` lineage and `tekton.dev/retryStrategy: partial`; the UI surfaces the setup failure if partial conditions are not met. After create, link to the new PipelineRun.
 
 **CLI:** `tkn pipelinerun retry <name>` defaults to `--full`. Use `--partial` to request partial retry; the command fails if the controller cannot satisfy the partial request. `tkn pipeline start --last / --use-pipelinerun` remains available for scripts that do not need lineage — it has no `retryOf` annotation and is unaffected by this design.
-
-Preview: optional client best-effort; not a guaranteed server dry-run.
 
 ### Performance
 
@@ -668,7 +699,9 @@ server-side planner.
 
 ## Implementation Plan
 
-### Phase 1 (v1)
+### Phase 1 (Alpha)
+
+Gated behind `enable-api-fields: alpha`.
 
 1. Failed subgraph library + tests (rules 1–9)
 2. CRD/status fields for retry metadata and memoized results; lineage annotations
@@ -680,7 +713,14 @@ server-side planner.
 7. Docs: TTL, opt-in PVC reuse, Pending/deadline behavior, no reproducibility
    claim, idempotency warnings, and no status forgery
 
-Deliverable: K8s-only retry while source data still exists.
+Deliverable: K8s-only retry while source data still exists, available under the alpha flag.
+
+### Phase 1b (Beta)
+
+Promote to `enable-api-fields: beta` once the alpha implementation is stable and feedback from early adopters is incorporated. Beta graduation requires:
+- No breaking API changes since alpha
+- Test coverage for all subgraph rules, harvest order, chained retries, and fail-closed partial behavior
+- CLI (`tkn pipelinerun retry`) and Dashboard/Console Retry action shipping and tested
 
 ### Phase 2
 
