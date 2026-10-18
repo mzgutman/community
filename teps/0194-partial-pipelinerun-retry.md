@@ -2,7 +2,7 @@
 status: proposed
 title: Partial PipelineRun Retry
 creation-date: '2026-10-13'
-last-updated: '2026-10-13'
+last-updated: '2026-10-18'
 authors:
 - '@mzgutman'
 collaborators: []
@@ -28,7 +28,7 @@ an actionable condition.
 
 **Key capabilities:**
 - Compute the failed subgraph (failed tasks + cascaded skips + required dependents)
-- Automatically choose partial retry when possible, otherwise full retry when the source supports it
+- Honor the user-requested `--full` or `--partial` strategy; fail closed for `--partial` when required data is unavailable
 - Memoize results from bypassed successful tasks (controller-owned status)
 - Reuse a durable **user-owned PVC** when the retry still needs workspace files
 - Pin the retry to the original resolved Pipeline/Task definitions
@@ -64,10 +64,10 @@ when a valid new run can be constructed.
 4. Cross-namespace retries
 5. Automatic adaptive strategy selection without user input; users explicitly choose `--full` or `--partial`
 6. User-modified memoized results
-7. Full Tekton Chains integration (must not fake skipped-task success; Chains contract is v2)
+7. Full Tekton Chains integration (must not fake skipped-task success; Chains contract is later / Phase 3)
 8. Recreating, copying, or re-cloning workspaces; transferring PVC ownership; blocking source cleanup
 9. Authoritative server-side dry-run/preview API (clients may offer best-effort preview)
-10. Retry after the source PipelineRun itself has been garbage-collected (v2 / Results / artifacts)
+10. Retry after the source PipelineRun itself has been garbage-collected (Phase 2 / Results / artifacts)
 
 ### Use Cases
 
@@ -80,11 +80,11 @@ Expensive `clone`/`build` succeeded; `test` flakes. Retry reuses build outputs a
 #### Use Case 3: Credential Expiry at the End
 Long pipeline fails on `publish-release` due to token TTL. Refresh credentials and retry the last stages if workspace/results are still available.
 
-**Caveat for all use cases:** Partial reuse in v1 requires the source PipelineRun
+**Caveat for all use cases:** Partial reuse requires the source PipelineRun
 and required TaskRun/result data to remain available. If TaskRuns or results have
 been pruned but the source PipelineRun still contains enough information, the
 controller can fall back to a full retry. If the source PipelineRun itself has
-been pruned, v1 cannot reconstruct the request; environments that prune runs in
+been pruned, the live-data design cannot reconstruct the request; environments that prune runs in
 minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
 
 ### Requirements
@@ -102,7 +102,7 @@ minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
 - Include skip cascades (`ParentTasksSkip`, `StoppingSkip`, `MissingResultsSkip`, timeout/graceful-stop skips)
 - Exclude `WhenExpressionsSkip` (re-evaluate)
 - Honor `onError: continue` rules (see Design Details)
-- Matrix: if any combination fails, re-run **all** combinations (v1)
+- Matrix: if any combination fails, re-run **all** combinations (initial release)
 - Exclude finally from the partial subgraph (they run fresh on the new PR); an empty or finally-only partial subgraph selects full retry when possible
 
 **Planning:**
@@ -118,12 +118,12 @@ minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
 - Partial retry requires all required results; if any are missing or unreadable, setup fails with an actionable condition for `--partial`
 - Respect the ~4KB result size limit; large payloads belong in artifacts/CAS, not result fields
 - - **Authz:** Harvest only what the controller is already allowed to read.
-  Tekton Results is out of v1. If required results are missing/unreadable, full retry
+  Tekton Results is out of alpha/beta. If required results are missing/unreadable, full retry
   when possible; never trust unsigned client-supplied values or forge TaskRun
-  success. v2 may fetch payloads via a caller-authorized verified snapshot;
+  success. Phase 2 may fetch payloads via a caller-authorized verified snapshot;
   planning remains server-side.
 
-**Workspace (v1 policy):**
+**Workspace (alpha/beta policy):**
 - Supported path: **opt-in reuse of an existing user-owned PVC** explicitly listed
   by the user on the retry PipelineRun, in the retry's namespace, whose lifetime
   does not depend on the source run
@@ -140,7 +140,7 @@ minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
   claim. This is Tekton-level best-effort exclusivity; storage enforcement and
   Pods outside Tekton are out of scope.
 
-**User-owned PVC selection (v1):**
+**User-owned PVC selection (alpha/beta):**
 - User must explicitly list `spec.workspaces[].persistentVolumeClaim` on the retry PipelineRun
 - The PVC must exist in the same namespace (validated by admission)
 - The PVC name is typically copied from the source or environment config
@@ -165,7 +165,7 @@ minutes (e.g. some Konflux setups) need a later Results/artifact-based design.
 - Retry lineage metadata and source references are immutable after creation
 - Clients cannot write controller-owned retry status or memoized results
 - The controller must not forge TaskRun status for bypassed tasks
-- v1 harvest uses only the controller's existing authorization; unreadable
+- Alpha/beta harvest uses only the controller's existing authorization; unreadable
   historical data is never trusted and selects full retry when possible
 - **RBAC enforcement for harvest:**
   - Controller uses SubjectAccessReview (SAR) to check `get` TaskRuns in the namespace
@@ -192,6 +192,12 @@ Tekton are out of scope.
 - Feature gated behind `enable-api-fields` flag, graduating alpha → beta → stable
 
 ## Proposal
+
+**Terminology used in this TEP:**
+- **alpha / beta / stable** — feature graduation via `enable-api-fields` (Implementation Plan Phase 1 / 1b).
+- **live-data path** — the initial design that harvests from live cluster objects while the source PipelineRun and related data still exist.
+- **Phase 2** — later Results / artifact-backed persistence that can survive source garbage collection.
+- `apiVersion: tekton.dev/v1` — the Kubernetes API version; unrelated to the terms above.
 
 Introduce partial retry by:
 
@@ -240,19 +246,19 @@ spec:
 **Workspace reuse:** Reuse is opt-in and refers to the current contents of the
 user-owned PVC after the source run is terminal. Tekton does not snapshot,
 rollback, or verify filesystem consistency, and makes no reproducibility claim.
-This is a narrow v1 compatibility path, not the general persistence model.
+This is a narrow live-data compatibility path, not the general persistence model.
 
 **`onError: continue` result staleness:** If a failed continue-task emitted a result that a successful downstream consumed, that downstream is not in the subgraph; a different result on retry can leave that work stale.
 
-**Side effects:** Tekton does not detect non-idempotent tasks. v1 warns in UX/docs; it does not block automatically.
+**Side effects:** Tekton does not detect non-idempotent tasks. Docs/UX warn; the feature does not block automatically.
 
-**User-owned PVC only:** `volumeClaimTemplate` claims owned/cleaned up with the source run are **not** a v1 guarantee. If partial retry needs a missing claim, select full retry only when the new run can be constructed with valid workspace bindings; do not reconstruct or transfer the source-owned claim.
+**User-owned PVC only:** `volumeClaimTemplate` claims owned/cleaned up with the source run are **not** guaranteed in alpha/beta. If partial retry needs a missing claim, select full retry only when the new run can be constructed with valid workspace bindings; do not reconstruct or transfer the source-owned claim.
 
 **RWO busy behavior:** A retry waits in `Pending` and requeues while a visible
 Tekton run still uses the claim. After the configured deadline, it fails with
 an actionable condition. A Lease, dedicated coordination resource, or stronger
 cross-controller locking protocol is deferred unless implementation experience
-shows that best-effort exclusivity is insufficient for v1.
+shows that best-effort exclusivity is insufficient for the initial release.
 
 **Clarification: Source cleanup and RWO wait:**
 - Retry **detects** when source is still using the claim (observed state)
@@ -263,7 +269,7 @@ shows that best-effort exclusivity is insufficient for v1.
 **Pruning:** If source TaskRuns or required results are gone while the source
 PipelineRun and resolved definition remain, partial retry may be unavailable;
 the controller selects full retry when possible. If the source PipelineRun or
-required run configuration is gone, v1 cannot reconstruct the retry. Durable
+required run configuration is gone, the live-data design cannot reconstruct the retry. Durable
 post-GC retry is a later Results/artifact design.
 
 **Task-level retry budget:** Each retry PipelineRun is a new execution; `spec.retries` budgets reset.
@@ -288,9 +294,9 @@ The controller applies these rules to the source `PipelineRunFacts`:
 - Downstream validation-failed (missing result): included
 - Downstream `runAfter` only and succeeded: excluded
 
-**Rule 5 - Matrix (v1):** Any combination failed → re-run all combinations.
-- Rationale: Matrix expansion happens at task level; no partial-within-matrix in v1.
-- Future: v2 could support per-combination retry if needed.
+**Rule 5 - Matrix (initial release):** Any combination failed → re-run all combinations.
+- Rationale: Matrix expansion happens at task level; no partial-within-matrix in alpha/beta.
+- Future: a later release could support per-combination retry if needed.
 
 **Rule 6 - Finally:** Not in the partial subgraph; they run fresh on either retry strategy. If *only* finally failed, the partial subgraph is empty and the controller selects a full retry when possible.
 
@@ -336,7 +342,7 @@ status:
 `$(tasks.X.results.Y)` has no live TaskRun.
 
 **Where results live vs who can read them:** Harvest is not only a data-structure
-problem. Access depends on **storage** and **identity**. In v1, only the
+problem. Access depends on **storage** and **identity**. In the live-data path (alpha/beta), only the
 controller's existing authorization is used:
 
 | Store | Typical reader | Controller harvest? |
@@ -344,24 +350,24 @@ controller's existing authorization is used:
 | Source `PipelineRun.status.results[]` | Anyone who can `get` that PR | Often yes, if the controller already reconciles that namespace |
 | Source `TaskRun.status.results[]` | `get`/`list` TaskRuns in that namespace | **Not guaranteed** (namespace-scoped installs, extra RBAC, objects already GC’d) |
 | Source `PipelineRun.status.retriedTaskResults[]` | Anyone who can `get` that PR | Yes — controller-owned status, same authorization as reading the source PR; enables chained retries where earlier TaskRuns are gone |
-| Tekton Results records | Results API authz (often per-tenant / user) | **Not a v1 store.** V2 access is caller-authorized; the Pipelines controller SA is not assumed to query all namespaces’ stored runs. |
+| Tekton Results records | Results API authz (often per-tenant / user) | **Not an alpha/beta store.** Phase 2 access is caller-authorized; the Pipelines controller SA is not assumed to query all namespaces’ stored runs. |
 | Artifacts / CAS | Store-specific credentials | Same: do not assume cluster-wide controller access |
 
 **Implication:** The controller should harvest only what its **own** RBAC allows.
 If required historical data is unreadable, partial retry is unavailable; the
 controller selects full retry when it can construct one. A client-supplied
 payload is never a fallback and must not impersonate TaskRun success.
-Caller-authorized fetching is reserved for the v2 snapshot protocol below.
+Caller-authorized fetching is reserved for the Phase 2 snapshot protocol below.
 
 Split two jobs that the first drafts lumped together:
 
-1. **Plan (subgraph)** — keep **server-side** for v1 (one implementation, no client skew).
-2. **Fetch result bytes** — in v1, the controller fetches only when authorized.
+1. **Plan (subgraph)** — keep **server-side** for alpha/beta (one implementation, no client skew).
+2. **Fetch result bytes** — in the live-data path, the controller fetches only when authorized.
    If required bytes are unavailable, it selects full retry when possible. In
-   v2, a caller-authorized client or broker may fetch historical data and
+   Phase 2, a caller-authorized client or broker may fetch historical data and
    provide a verified snapshot for partial retry.
 
-**v1 default (cluster objects the controller can already see):** Controller copies
+**Live-data default (cluster objects the controller can already see):** Controller copies
 into **status** memoization (e.g. `status.retriedTaskResults`).
 
 **Harvest order (during setup):**
@@ -378,11 +384,11 @@ into **status** memoization (e.g. `status.retriedTaskResults`).
 If the controller **cannot** read required objects, it must not silently skip
 memoization or trust client-provided values. For `--partial` requests this is
 a hard failure (fail closed); there is no silent fallback to full retry when
-the user explicitly requested partial. A later v2 contract may allow a
+the user explicitly requested partial. A later Phase 2 contract may allow a
 caller-authorized service to attach a verified snapshot with enough provenance
 for the controller to accept the values without forging TaskRun conditions.
 
-**V2 direction:** Let the Results or artifact service provide a verified snapshot of the source run’s results, authorized for the caller and bound to the source PipelineRun and retry plan. The controller verifies the snapshot before using it. If the caller cannot obtain one, partial retry is unavailable; 
+**Phase 2 direction:** Let the Results or artifact service provide a verified snapshot of the source run’s results, authorized for the caller and bound to the source PipelineRun and retry plan. The controller verifies the snapshot before using it. If the caller cannot obtain one, partial retry is unavailable; 
 the controller uses full retry when possible.
 The snapshot can carry small values inline and reference large artifacts by content digest and opaque store reference. The retry API stays storage-neutral; OCI-backed storage is one possible implementation (TEP-0193).
 
@@ -398,10 +404,10 @@ PipelineRun.
 Planning and fetching historical results are separate (least privilege). The
 Pipelines controller is not granted cluster-wide Results access for all tenants.
 
-- **v1:** Controller harvests only what its existing RBAC allows. Clients do not
+- **Live-data (alpha/beta):** Controller harvests only what its existing RBAC allows. Clients do not
   reimplement subgraph rules. Unreadable required results → full retry when
   possible; never accept unsigned client-supplied values or forge TaskRun success.
-- **v2 handoff:** Controller publishes the authoritative plan and required
+- **Phase 2 handoff:** Controller publishes the authoritative plan and required
   results. A client or broker fetches with the **caller's** credentials and
   returns an immutable snapshot. The controller verifies binding to source UID,
   plan, namespace/tenant, and retention/expiry, then memoizes accepted values in
@@ -417,10 +423,9 @@ Pipelines controller is not granted cluster-wide Results access for all tenants.
   
 ### API Shape
 
-**Decision:** The retry **is** the new PipelineRun. No `POST .../retry` API in v1.
-All retry requests use the same adaptive behavior; clients do not set a
-partial/full strategy field. The controller records its selection in status
-before scheduling children.
+**Decision:** The retry **is** the new PipelineRun. No `POST .../retry` API in alpha or beta.
+Clients request a strategy via the `tekton.dev/retryStrategy` annotation (`full` or `partial`);
+the controller records the selected strategy and reason in status before scheduling children.
 
 Dry-run/preview needs a separate design. Clients may estimate a plan locally
 for UX but that is **not** authoritative.
@@ -430,7 +435,7 @@ and execution must be split.
 
 ### Workspace and PVC Handling
 
-**v1 policy:** Reuse existing **user-owned PVCs** only. No copy, re-clone,
+**Alpha/beta policy:** Reuse existing **user-owned PVCs** only. No copy, re-clone,
 ownership transfer, or blocking source cleanup.
 
 If partial retry needs workspace files and the claim is gone, select full retry
@@ -439,7 +444,7 @@ guidance (use a durable user-owned PVC, or create a new run with valid
 workspace configuration).
 
 `volumeClaimTemplate` / source-owned claims that GC with the source run are
-not a v1 guarantee.
+not guaranteed in alpha/beta.
 
 **RWO:** Do not assume two PipelineRuns can share a ReadWriteOnce claim.
 The controller must not assign the claim to a retry while another visible
@@ -463,7 +468,7 @@ create).
 
 ### Data Availability
 
-#### v1: Live cluster data
+#### Live cluster data (alpha/beta)
 
 | Retry type | Required data | If unavailable |
 |---|---|---|
@@ -473,11 +478,11 @@ create).
 PVC reuse is opt-in. The user must provide a same-namespace, user-owned PVC in the retry spec. Tekton uses its current contents; it does not snapshot or guarantee reproducibility. Source-owned claims are not transferred.
 The source PipelineRun, TaskRuns, results, and PVC may be removed at different times. Partial retry is available only while all required data remains present and readable.
 
-#### v2: Data that survives source cleanup
+#### Phase 2: Data that survives source cleanup
 
-V2 may use Results or an artifact service to preserve and provide the data needed for partial retry after the source run is removed. The service should authorize access for the caller, and the controller should verify the data before using it. If verified data is unavailable, the controller uses full retry when possible.
+Phase 2 may use Results or an artifact service to preserve and provide the data needed for partial retry after the source run is removed. The service should authorize access for the caller, and the controller should verify the data before using it. If verified data is unavailable, the controller uses full retry when possible.
 
-The design should work with different storage backends; OCI is one possible option. The Pipelines controller should not need broad Results access or direct registry access. PVC reuse remains a v1 mechanism, not durable v2 storage.
+The design should work with different storage backends; OCI is one possible option. The Pipelines controller should not need broad Results access or direct registry access. PVC reuse remains a live-data mechanism, not durable Phase 2 storage.
 
 ### API Design
 
@@ -609,8 +614,8 @@ re-executes the full DAG with no controller strategy or lineage
 **With:** `tkn pipelinerun retry <name>` (default `--full`) or `tkn pipelinerun retry <name> --partial` for explicit partial reuse. The controller executes the requested strategy; `--partial` is fail-closed if conditions are not met.
 Dashboard and OpenShift Console **replace** the existing Rerun button with a single **Retry** action that includes a full/partial selector, defaulting to full. The `tkn pipeline start --last` path remains in the CLI only, for scripts that do not need lineage.
 
-Minimal v1 surface: annotations + status plan/results + reconciler setup path.
-No aggregated API, no new CRD required for v1.
+Minimal alpha/beta surface: annotations + status plan/results + reconciler setup path.
+No aggregated API, no new CRD required for alpha/beta.
 
 ### Flexibility
 
@@ -655,11 +660,11 @@ validated in tests; the architectural win is **one** planner.
 | Parameter changes invalidate preserved results | `--partial` requires effective params to be identical to the source; any diff causes setup failure with `strategyReason: parameter-mismatch` |
 | RWO busy | Pending + requeue until deadline if the selected strategy uses the claim |
 | Tekton/PVC exclusivity | Prevent assignment when a visible Tekton run uses the claim; storage and other Pods are out of scope |
-| Source pruned quickly | Document v1 window; v2 Results/artifacts |
+| Source pruned quickly | Document live-data window; Phase 2 Results/artifacts |
 | Result size | 4KB limit; artifacts for large data |
 | Chains false attestation | No forged TaskRun success |
-| `onError: continue` staleness | Documented v1 tradeoff |
-| Unauthorized historical results | Do not reuse them; fail closed for `--partial`. V2 may enable partial retry through a verified, source- and plan-bound snapshot |
+| `onError: continue` staleness | Documented initial-release tradeoff |
+| Unauthorized historical results | Do not reuse them; fail closed for `--partial`. Phase 2 may enable partial retry through a verified, source- and plan-bound snapshot |
 | Chained retry after earlier TaskRuns are GC'd | Carry-forward invariant: each retry's `retriedTaskResults` is the union of fresh harvest and `source.status.retriedTaskResults[]`; one-hop lookup is always sufficient |
 
 ### Drawbacks
@@ -667,17 +672,17 @@ validated in tests; the architectural win is **one** planner.
 1. Controller/reconciler must understand retry setup (not a zero-touch normal PR).
 2. Inline `pipelineSpec` increases object size (usually acceptable vs etcd limits).
 3. Async UX (create then watch) vs a single HTTP result.
-4. v1 workspace and TTL limits will not cover all Konflux-style prune-heavy clusters.
+4. Alpha/beta workspace and TTL limits will not cover all Konflux-style prune-heavy clusters.
 5. Users can still full-rerun; partial retry is an efficiency feature with constraints.
 
 ## Alternatives
 
 ### Alternative 1: Client-side planning
-Each client computes the subgraph and applies YAML. **Rejected for v1:**
+Each client computes the subgraph and applies YAML. **Rejected for the initial release:**
 duplication, version skew, weaker consistency (ADR: Planning Boundary).
 
 ### Alternative 2: HTTP `/retry` subresource
-**Rejected for v1:** Kubernetes-routed custom API needs an extra API server
+**Rejected for the initial release:** Kubernetes-routed custom API needs an extra API server
 (aggregation). (ADR: API Shape.)
 
 ### Alternative 3: Synthetic TaskRuns
@@ -688,10 +693,10 @@ breaks Chains/Pod assumptions.
 **Deferred:** needs policies and loop protection.
 
 ### Alternative 5: Recreate/copy workspace or steal PVC ownership
-**Deferred:** high complexity; couples to cleanup. v1 = user-owned PVC only.
+**Deferred:** high complexity; couples to cleanup. Alpha/beta = user-owned PVC only.
 
 ### Alternative 6: Grant the Pipelines controller broad Results access
-**Rejected as the general v2 solution:** it expands tenant permissions, couples
+**Rejected as the general Phase 2 solution:** it expands tenant permissions, couples
 the controller to deployment-specific Results authorization, and may still not
 represent the end user's permission to reuse a result. A caller-authorized,
 verified result snapshot preserves least privilege while retaining one
@@ -732,8 +737,8 @@ namespace-scoped broker produces a verifiable, source- and plan-bound result
 snapshot. The controller consumes only verified snapshots or data it can read
 under its existing permissions; it does not receive cluster-wide Results
 access. Retention, expiry, revocation, large-value references, and the exact
-snapshot transport are defined by the v2 API contract. Optional result-bubbling
-documentation may extend the v1 availability window but does not replace the
+snapshot transport are defined by the Phase 2 API contract. Optional result-bubbling
+documentation may extend the live-data availability window but does not replace the
 authorization protocol.
 
 ### Phase 2 (Optional) — Integration with OCI artifacts (TEP-0193)
@@ -744,10 +749,10 @@ When TEP-0193 (Tekton Artifacts OCI Storage) is stable:
 - Enable retry across cluster-GC boundaries via OCI-backed snapshots
 - Caller-authorized snapshot protocol (least privilege)
 
-**Note:** v1 does NOT require TEP-0193:
+**Note:** Alpha/beta does NOT require TEP-0193:
 - Retry logic is agnostic to how results are stored (status fields, TaskRuns, future artifact stores)
-- v1 uses existing cluster RBAC and data sources; no new infrastructure needed
-- This integration is a future enhancement, not a blocker for v1 adoption
+- Alpha/beta uses existing cluster RBAC and data sources; no new infrastructure needed
+- This integration is a future enhancement, not a blocker for alpha/beta adoption
 
 ### Phase 3
 
@@ -764,7 +769,7 @@ Integration: create annotated PR → setup → selected task set only; verify
 partial retry when required data is available; verify full fallback when
 required results are missing/unreadable or the partial subgraph is empty;
 verify terminal setup failure when neither strategy is constructible; UID
-mismatch. V2 integration should also test snapshot signature/provenance
+mismatch. Phase 2 integration should also test snapshot signature/provenance
 validation, source UID and plan-digest mismatch, tenant binding, expiry,
 unauthorized access, and large-result references.
 
