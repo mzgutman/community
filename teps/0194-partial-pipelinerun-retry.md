@@ -409,6 +409,9 @@ This behavior is correct and desired, but must be documented internally: entries
 
 `isBypassed()` is only ever set to `true` during retry setup for tasks in `preservedTasks`. Normal (non-retry) PipelineRuns never set this predicate, so existing behavior for all non-retry runs is unchanged.
 
+**Execution-status context variables for bypassed tasks (`$(tasks.X.status)`):**
+Finally tasks may guard their `when` expressions on `$(tasks.X.status)` (e.g., `$(tasks.build.status) == "Succeeded"`) or the aggregate `$(tasks.status)`. When task X is bypassed in a partial retry, no live TaskRun exists for X on the retry PipelineRun. The execution-status context map must therefore be seeded with `"Succeeded"` for each bypassed task before finally tasks are scheduled. The aggregate `$(tasks.status)` is computed from the union of live and bypassed task statuses. This is an extension of the `isBypassed()` predicate: the controller must populate the status context map for bypassed tasks in addition to the result-resolution path.
+
 If the controller **cannot** read required objects, it must not silently skip
 memoization or trust client-provided values. For `--partial` requests this is
 a hard failure (fail closed); there is no silent fallback to full retry when
@@ -706,6 +709,7 @@ validated in tests; the architectural win is **one** planner.
 | Unauthorized historical results | Do not reuse them; fail closed for `--partial`. Phase 2 may enable partial retry through a verified, source- and plan-bound snapshot |
 | Chained retry after earlier TaskRuns are GC'd | Carry-forward invariant: each retry's `retriedTaskResults` is the union of fresh harvest and `source.status.retriedTaskResults[]`; one-hop lookup is always sufficient |
 | Bypassed matrix task results unavailable to downstream re-running tasks | Harvest step 2 aggregates all N source TaskRuns for the matrix task into an ordered `type: array` entry in `retriedTaskResults`; `isBypassed()` predicate added to `ResolvedPipelineTask` and threaded through all `isSuccessful() \|\| isFailure()` guards in result-resolution paths; `ResultsCache` pre-populated from memoized array before TaskRun scheduling; `GetTaskRunsResults()` semantics updated to include bypassed-task entries (sourced from memoized status, not live TaskRuns); no effect on non-retry PipelineRuns |
+| `$(tasks.X.status)` / `$(tasks.status)` incorrect for bypassed tasks in finally `when` | Controller seeds the execution-status context map with `"Succeeded"` for each bypassed task before scheduling finally tasks; aggregate `$(tasks.status)` is computed from the union of live and bypassed statuses |
 
 ### Drawbacks
 
