@@ -313,16 +313,16 @@ not an exhaustive inventory of deployments.
 
 | Pattern | Alpha `--partial` | Notes |
 | --- | --- | --- |
-| Main-DAG failure; results available via bubbled and/or source TaskRun results; no workspace files needed | ✅ Covered | Typical result-passing DAGs |
-| Same, plus durable **user-owned PVC** still bound on the retry | ✅ Covered | Opt-in PVC reuse; as-is contents |
-| Preserved matrix task feeding array/object results to a re-running consumer | ✅ Covered | Requires matrix aggregation + `isBypassed()` (Result Re-injection) |
-| Finally tasks present, and the **main DAG** had a failed subgraph | ✅ Covered | Finally always re-run fresh on the retry |
-| Finally `when` uses `$(tasks.X.status)` / `$(tasks.status)` for bypassed tasks | ✅ Covered | Seed execution-status context for preserved tasks |
-| Only finally failed (main DAG succeeded) | ❌ Not partial | `empty-subgraph`; user requests `--full` |
-| Workspace files needed from `volumeClaimTemplate` / source-owned PVC | ❌ Not partial | `workspace-unavailable`; `--full` with a new valid binding may work |
-| Source PipelineRun garbage-collected | ❌ Any retry | Live-data path cannot reconstruct the request (Phase 2) |
-| Nested PipelineRuns / custom tasks | ❌ Atomic only | Rules 7–8; no recursive inner partial retry |
-| Partial-within-matrix (retry only failed combinations) | ❌ Not in alpha | Rule 5: all-or-nothing re-run |
+| Main-DAG failure; results available via bubbled and/or source TaskRun results; no workspace files needed |  Covered | Typical result-passing DAGs |
+| Same, plus durable **user-owned PVC** still bound on the retry |  Covered | Opt-in PVC reuse; as-is contents |
+| Preserved matrix task feeding array/object results to a re-running consumer |  Covered | Requires matrix aggregation + `isBypassed()` (Result Re-injection) |
+| Finally tasks present, and the **main DAG** had a failed subgraph |  Covered | Finally always re-run fresh on the retry |
+| Finally `when` uses `$(tasks.X.status)` / `$(tasks.status)` for bypassed tasks |  Covered | Seed execution-status context for preserved tasks |
+| Only finally failed (main DAG succeeded) |  Not partial | `empty-subgraph`; user requests `--full` |
+| Workspace files needed from `volumeClaimTemplate` / source-owned PVC |  Not partial | `workspace-unavailable`; `--full` with a new valid binding may work |
+| Source PipelineRun garbage-collected |  Any retry | Live-data path cannot reconstruct the request (Phase 2) |
+| Nested PipelineRuns / custom tasks |  Atomic only | Rules 7–8; no recursive inner partial retry |
+| Partial-within-matrix (retry only failed combinations) |  Not in alpha | Rule 5: all-or-nothing re-run |
 
 **Full retry (`--full`)** is always available when the source PipelineRun and
 required run configuration remain: it does not need historical results or
