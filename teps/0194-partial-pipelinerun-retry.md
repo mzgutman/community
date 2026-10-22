@@ -29,7 +29,7 @@ run configuration is unavailable, setup fails.
 
 **Key capabilities:**
 - Compute the failed subgraph (failed tasks + cascaded skips + required dependents)
-- Honor the user-requested `--full` or `--partial` strategy; fail closed for `--partial` when required data is unavailable
+- Honor the requested --full or --partial strategy. If --partial is requested but its prerequisites are not met, mark the retry PipelineRun failed with an actionable reason before creating any TaskRuns; do not switch to a full retry.
 - Memoize results from bypassed successful tasks (controller-owned status)
 - Reuse a durable **user-owned PVC** when the retry still needs workspace files
 - Pin the retry to the original resolved Pipeline/Task definitions
