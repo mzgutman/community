@@ -115,7 +115,9 @@ post-GC retry.
 
 **Planning:**
 - Controller computes the subgraph and validates the user-requested strategy before scheduling TaskRuns
-- For --partial, an empty subgraph or unavailable required historical data causes the controller to create no TaskRuns and mark the retry PipelineRun terminally failed with an actionable strategyReason. The requested strategy remains partial; the controller must not trust client-supplied values or switch to a full retry. A retry that failed during setup is not a valid source for another partial retry.
+- For --partial, an empty subgraph or unavailable required historical data causes the controller to create no TaskRuns and mark the retry PipelineRun terminally failed with an actionable strategyReason.
+  The requested strategy remains partial; the controller must not trust client-supplied values or switch to a full retry. 
+  A retry that failed during setup is not a valid source for another partial retry.
 - For the default or explicit `--full`, run the full pipeline without requiring historical results
 - Clients do not implement subgraph logic
 - Do not create synthetic/ghost TaskRuns with forged `Succeeded` conditions
@@ -128,7 +130,9 @@ post-GC retry.
 - For bypassed **matrix tasks**, harvest step 2 finds all N source TaskRuns for the pipeline task, sorts them by TaskRun name for deterministic ordering, and aggregates each result name into a single `type: array` entry in `retriedTaskResults`; the array index order is fixed at harvest time and must match the source run's ordering
 - Persist accepted memoized results in **status** (not as the user-writable source of truth)
 - Partial retry requires all required results; if any are missing or unreadable, setup fails with an actionable condition for `--partial`
-- Respect the configured result-size to about 4 KB. Larger values must use artifacts.
+- Limit memoized results stored in status.retriedTaskResults to the configured max-result-size (about 4 KB by default). 
+  In alpha/beta, if a required result exceeds that limit, fail --partial setup with an actionable error; do not truncate or omit the result. 
+  Support for retrieving larger values through artifacts is a future     extension.
 - **Authz:** Harvest only what the controller is already allowed to read.
   Tekton Results is out of alpha/beta. If required results are missing or unreadable,
   an explicit `--partial` request fails; a full retry does not need those results.
