@@ -111,7 +111,7 @@ post-GC retry.
 - Exclude `WhenExpressionsSkip` (re-evaluate)
 - Honor `onError: continue` rules (see Design Details)
 - Matrix: if any combination fails, re-run **all** combinations (initial release)
-- Exclude finally from the partial subgraph (they run fresh on the new PR); an empty or finally-only partial subgraph makes an explicit `--partial` request fail. A full retry still runs finally tasks as part of the full pipeline.
+- Finally tasks are excluded from the partial subgraph. If a retry PipelineRun is created, its finally tasks are evaluated fresh in the normal finally phase, subject to their usual conditions. If only finally tasks failed in the source run, --partial fails with empty-subgraph; the user may request a separate --full retry.
 
 **Planning:**
 - Controller computes the subgraph and validates the user-requested strategy before scheduling TaskRuns
