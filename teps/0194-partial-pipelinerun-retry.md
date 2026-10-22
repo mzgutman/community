@@ -111,11 +111,11 @@ post-GC retry.
 - Exclude `WhenExpressionsSkip` (re-evaluate)
 - Honor `onError: continue` rules (see Design Details)
 - Matrix: if any combination fails, re-run **all** combinations (initial release)
-- Finally tasks are excluded from the partial subgraph. If a retry PipelineRun is created, its finally tasks are evaluated fresh in the normal finally phase, subject to their usual conditions. If only finally tasks failed in the source run, --partial fails with empty-subgraph; the user may request a separate --full retry.
+- Finally tasks are excluded from the partial subgraph. If a retry PipelineRun is created, its finally tasks are evaluated fresh in the normal finally phase, subject to their usual conditions. If only finally tasks failed in the source run, --partial fails with empty subgraph; the user may request a separate --full retry.
 
 **Planning:**
 - Controller computes the subgraph and validates the user-requested strategy before scheduling TaskRuns
-- For `--partial`, an empty subgraph or unavailable required historical results causes setup failure; never trust client-supplied values and never switch to full retry
+- For --partial, an empty subgraph or unavailable required historical data causes the controller to create no TaskRuns and mark the retry PipelineRun terminally failed with an actionable strategyReason. The requested strategy remains partial; the controller must not trust client-supplied values or switch to a full retry. A retry that failed during setup is not a valid source for another partial retry.
 - For the default or explicit `--full`, run the full pipeline without requiring historical results
 - Clients do not implement subgraph logic
 - Do not create synthetic/ghost TaskRuns with forged `Succeeded` conditions
